@@ -2,9 +2,10 @@ data:
   in_memory: 1
   num_workers: 12
 dist:
-  world_size: 8
+  world_size: 2
 logging:
-  folder: /tmp/
+  folder: /home/sourav/ffcv-imagenet
+  tensor_dump : /home/sourav/ffcv-imagenet/inet1
 lr:
   lr: 1.7
   lr_schedule_type: cyclic
@@ -16,7 +17,7 @@ resolution:
   min_res: 160
   start_ramp: 17
 training:
-  batch_size: 512
+  batch_size: 128
   bn_wd: 0
   distributed: 1
   epochs: 24
@@ -25,6 +26,14 @@ training:
   optimizer: sgd
   weight_decay: 0.0001
   use_blurpool: 1
+  one_shot_prune: 0
+  prune_epoch: 15
+  step_of_prune: 0
+  perc_to_prune: 0.50
+  iterative_prune: 0 
+  unfreeze_epoch: 30
+  epochs_to_densetrain: 10
+  epochs_to_finetune: 10
 validation:
   lr_tta: true
   resolution: 256

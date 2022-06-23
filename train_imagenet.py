@@ -1,3 +1,4 @@
+from contextlib import ContextDecorator
 import torch as ch
 from torch.cuda.amp import GradScaler
 from torch.cuda.amp import autocast
@@ -19,6 +20,9 @@ from uuid import uuid4
 from typing import List
 from pathlib import Path
 from argparse import ArgumentParser
+
+from CustomOptimizer import *
+from torch.utils.tensorboard import SummaryWriter
 
 from fastargs import get_current_config
 from fastargs.decorators import param
@@ -62,7 +66,8 @@ Section('lr', 'lr scheduling').params(
 
 Section('logging', 'how to log stuff').params(
     folder=Param(str, 'log location', required=True),
-    log_level=Param(int, '0 if only at end 1 otherwise', default=1)
+    log_level=Param(int, '0 if only at end 1 otherwise', default=1),
+    tensor_dump=Param(str, 'Tensorboard dump location', required=True)
 )
 
 Section('validation', 'Validation parameters stuff').params(
@@ -80,7 +85,15 @@ Section('training', 'training hyper param stuff').params(
     epochs=Param(int, 'number of epochs', default=30),
     label_smoothing=Param(float, 'label smoothing parameter', default=0.1),
     distributed=Param(int, 'is distributed?', default=0),
-    use_blurpool=Param(int, 'use blurpool?', default=0)
+    use_blurpool=Param(int, 'use blurpool?', default=0),
+    one_shot_prune= Param(int, 'one shot pruning value', default=0),
+    prune_epoch = Param(int, 'epoch to start pruning', default=0),
+    step_of_prune = Param(int, 'whether at the beginning or not', default=0),
+    perc_to_prune = Param(int, 'intensity of pruning', default=0),
+    iterative_prune = Param(int, 'to prunine iteratively?', default=0),
+    unfreeze_epoch = Param(int, 'epoch to unfreeeze', default=0),
+    epochs_to_densetrain = Param(int, 'number of epochs to densetrain', default=0),
+    epochs_to_finetune = Param(int, 'number of epochs to finetune', default=0)
 )
 
 Section('dist', 'distributed training options').params(
@@ -139,9 +152,18 @@ class ImageNetTrainer:
         self.train_loader = self.create_train_loader()
         self.val_loader = self.create_val_loader()
         self.model, self.scaler = self.create_model_and_scaler()
+        self.make_dump_dir()
         self.create_optimizer()
         self.initialize_logger()
         
+    @param('logging.tensor_dump')
+    def make_dump_dir(self,tensor_dump):
+        try:
+            os.makedirs(tensor_dump, exist_ok = True)
+            print("Directory  created successfully")
+        except OSError as error:
+            print("Directory can not be created")
+        self.tensor_dump = tensor_dump
 
     @param('dist.address')
     @param('dist.port')
@@ -188,9 +210,19 @@ class ImageNetTrainer:
     @param('training.optimizer')
     @param('training.weight_decay')
     @param('training.label_smoothing')
+    @param('training.one_shot_prune')
+    @param('training.prune_epoch')
+    @param('training.step_of_prune')
+    @param('training.perc_to_prune')
+    @param('training.unfreeze_epoch')
+    @param('training.iterative_prune')
+    @param('training.epochs_to_finetune')
+    @param('training.epochs_to_densetrain')
     def create_optimizer(self, momentum, optimizer, weight_decay,
-                         label_smoothing):
-        assert optimizer == 'sgd'
+                         label_smoothing,one_shot_prune,prune_epoch,step_of_prune,
+                 perc_to_prune,unfreeze_epoch,
+                 iterative_prune,epochs_to_finetune,epochs_to_densetrain):
+        #assert optimizer == 'sgd'
 
         # Only do weight decay on non-batchnorm parameters
         all_params = list(self.model.named_parameters())
@@ -204,7 +236,22 @@ class ImageNetTrainer:
             'weight_decay': weight_decay
         }]
 
-        self.optimizer = ch.optim.SGD(param_groups, lr=1, momentum=momentum)
+        #self.optimizer = ch.optim.SGD(param_groups, lr=1, momentum=momentum)
+        self.optimizer = CustomOptimizer(param_groups,lr=1, 
+        momentum=momentum,
+        
+        len_step = len(self.train_loader),
+    
+        one_shot_prune  = one_shot_prune,
+        prune_epoch = prune_epoch,
+        step_of_prune = step_of_prune,
+        perc_to_prune = perc_to_prune,
+
+        iterative_prune = iterative_prune,
+        unfreeze_epoch = unfreeze_epoch,
+        epochs_to_densetrain = epochs_to_densetrain,
+        epochs_to_finetune = epochs_to_finetune
+   )
         self.loss = ch.nn.CrossEntropyLoss(label_smoothing=label_smoothing)
 
     @param('data.train_dataset')
@@ -311,12 +358,15 @@ class ImageNetTrainer:
         if self.gpu == 0:
             ch.save(self.model.state_dict(), self.log_folder / 'final_weights.pt')
 
-    def eval_and_log(self, extra_dict={}):
+    
+    def eval_and_log(self,extra_dict={}):
+        
+        writer = SummaryWriter(self.tensor_dump)
         start_val = time.time()
         stats = self.val_loop()
         val_time = time.time() - start_val
         if self.gpu == 0:
-            self.log(dict({
+            self.log(writer,dict({
                 'current_lr': self.optimizer.param_groups[0]['lr'],
                 'top_1': stats['top_1'],
                 'top_5': stats['top_5'],
@@ -414,6 +464,7 @@ class ImageNetTrainer:
         return stats
 
     @param('logging.folder')
+    
     def initialize_logger(self, folder):
         self.val_meters = {
             'top_1': torchmetrics.Accuracy(compute_on_step=False).to(self.gpu),
@@ -422,6 +473,7 @@ class ImageNetTrainer:
         }
 
         if self.gpu == 0:
+            
             folder = (Path(folder) / str(self.uid)).absolute()
             folder.mkdir(parents=True)
 
@@ -436,8 +488,9 @@ class ImageNetTrainer:
             with open(folder / 'params.json', 'w+') as handle:
                 json.dump(params, handle)
 
-    def log(self, content):
+    def log(self,writer,content):
         print(f'=> Log: {content}')
+        writer.add_scalar('Accuracy',content['top_1']*100 , content['epoch'])
         if self.gpu != 0: return
         cur_time = time.time()
         with open(self.log_folder / 'log', 'a+') as fd:
